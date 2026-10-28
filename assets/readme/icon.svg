@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="1024" height="1024" role="img" aria-labelledby="t">
+  <title id="t">hostblock icon: a white shield on a dark rounded square</title>
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B3442"/>
+      <stop offset="1" stop-color="#151A22"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS icon grid: 824/1024 body, 185/1024 corner radius -->
+  <rect x="9.77" y="9.77" width="80.47" height="80.47" rx="18.07" fill="url(#body)"/>
+  <!-- shield.fill shape -->
+  <path d="M50 24 L71 31.5 V49 C71 62.5 62 71.5 50 77 C38 71.5 29 62.5 29 49 V31.5 Z" fill="#F4F6F8"/>
+  <!-- right half shaded for depth -->
+  <path d="M50 24 L71 31.5 V49 C71 62.5 62 71.5 50 77 Z" fill="#C9D1DB"/>
+</svg>
