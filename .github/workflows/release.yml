@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: ./test.sh
+      - name: Build universal menu bar binary
+        run: |
+          mkdir -p build
+          xcrun swiftc -O -framework Cocoa -target arm64-apple-macos11 menubar/main.swift -o build/hostblock-menubar-arm64
+          xcrun swiftc -O -framework Cocoa -target x86_64-apple-macos11 menubar/main.swift -o build/hostblock-menubar-x86_64
+          lipo -create build/hostblock-menubar-arm64 build/hostblock-menubar-x86_64 -output build/hostblock-menubar
+          lipo -info build/hostblock-menubar
+      - name: Package source + binary
+        run: |
+          NAME="hostblock-${GITHUB_REF_NAME}"
+          mkdir -p "stage/$NAME/build"
+          git archive --format=tar HEAD | tar -x -C "stage/$NAME"
+          cp build/hostblock-menubar "stage/$NAME/build/"
+          (cd stage && zip -r -X "../$NAME-macos.zip" "$NAME")
+          shasum -a 256 "$NAME-macos.zip" > "$NAME-macos.zip.sha256"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "hostblock-${GITHUB_REF_NAME}-macos.zip" \
+            "hostblock-${GITHUB_REF_NAME}-macos.zip.sha256" \
+            --title "$GITHUB_REF_NAME" --generate-notes

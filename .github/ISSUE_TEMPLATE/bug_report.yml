@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in hostblock does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not paste your blocklist; it is never needed.
+        Security problems go through the Security tab, not here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. hostblock add example.com
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "macOS 15.1 (Apple silicon)"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: hostblock version or commit
+      placeholder: "v0.1.0"
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part
+      options:
+        - Daemon (hostblockd)
+        - CLI (hostblock)
+        - Menu bar app
+        - Install scripts
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output of `hostblock status` and relevant log lines
+      description: From /Library/Logs/hostblock/hostblockd.log. Remove any domains you do not want to share.
+      render: text
