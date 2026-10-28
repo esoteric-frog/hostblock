@@ -1,9 +1,30 @@
-# hostblock (macOS port)
+<p align="center">
+  <img src="./assets/readme/icon.svg" width="96" alt="hostblock icon: a white shield on a dark rounded square">
+</p>
 
-An append-only website blocker with a menu bar shield. Click the shield, type a
-site, confirm, and it is routed to `127.0.0.1` and `::1` in `/etc/hosts` for good.
+<h1 align="center">hostblock</h1>
 
-Ported from the Linux/Omarchy version on 2026-09-08. Same four commitments:
+<p align="center">
+  An append-only website blocker for macOS: once a site is in, it stays in.
+</p>
+
+<p align="center">
+  <a href="https://github.com/esoteric-frog/hostblock/actions/workflows/ci.yml"><img src="https://github.com/esoteric-frog/hostblock/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <img src="https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple" alt="Platform: macOS">
+  <img src="https://img.shields.io/badge/language-Python%20%2B%20Swift-3776AB?logo=python&amp;logoColor=white" alt="Language: Python and Swift">
+  <a href="https://github.com/esoteric-frog/hostblock/releases"><img src="https://img.shields.io/github/v/release/esoteric-frog/hostblock?include_prereleases" alt="Latest release"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
+</p>
+
+<p align="center">
+  <img src="./assets/readme/hero.gif" width="100%" alt="Demo: click the shield in the menu bar, type example.com, review the four /etc/hosts lines (127.0.0.1 and ::1 for example.com and www.example.com), press Block permanently, and the panel says Blocked.">
+</p>
+
+Click the shield, type a site, confirm, and it is routed to `127.0.0.1` and `::1`
+in `/etc/hosts` for good. A root daemon owns that section of the file, puts it back
+within about 150 ms if anything edits it, and has no command to remove a site.
+
+## Why it is different
 
 1. **Append-only at the protocol level.** The daemon implements `add`, `list`,
    `status` and nothing else. There is no `remove` verb.
@@ -15,37 +36,58 @@ Ported from the Linux/Omarchy version on 2026-09-08. Same four commitments:
    blocklist. `hostblock list` in a terminal is the only place it is shown.
 4. **Confirm before every add**, with the exact lines previewed.
 
-## Use
+## How it works
+
+<p align="center">
+  <img src="./assets/readme/how-it-works.svg" width="100%" alt="Diagram: the menu bar app and the hostblock CLI talk to the root daemon hostblockd over a Unix socket (0660 root:admin) that only accepts add, list and status. hostblockd owns a fenced section of /etc/hosts between BEGIN and END hostblock markers; kqueue reports any edit and the daemon restores the fence in about 150 ms.">
+</p>
+
+- **`daemon/hostblockd`**: Python 3 stdlib only, run as a root `LaunchDaemon`.
+  One `select()` loop over a kqueue and the control socket.
+- **`cli/hostblock`**: unprivileged client. Talks to the socket; needs `admin` group.
+- **`menubar/main.swift`**: `NSStatusItem` + `NSPopover`, run by a per-user
+  `LaunchAgent`. It only shells out to the CLI.
+
+## Install
+
+Requires macOS with the Xcode Command Line Tools (`xcode-select --install`) for
+`swiftc` and `/usr/bin/python3`.
+
+```sh
+git clone https://github.com/esoteric-frog/hostblock.git
+cd hostblock
+./build.sh       # compiles the menu bar app into build/
+./install.sh     # asks for sudo once, then loads the daemon and the menu bar agent
+```
+
+`install.sh` puts the daemon in `/usr/local/libexec/hostblock`, the CLI in
+`/usr/local/bin/hostblock`, state in `/Library/Application Support/hostblock`, and
+saves a one-time copy of your original file to `/etc/hosts.pre-hostblock`.
+
+## Usage
 
 From the menu bar: click the shield, type a domain, press Return, confirm.
 
 From a terminal:
 
 ```sh
-hostblock add reddit.com          # also blocks www.reddit.com, on 127.0.0.1 and ::1
-hostblock add https://x.com/home  # pasted URLs are fine
-hostblock list                    # the only place blocked sites are shown
+hostblock add example.com           # also blocks www.example.com, on 127.0.0.1 and ::1
+hostblock add https://example.com/a # pasted URLs are fine
+hostblock list                      # the only place blocked sites are shown
 hostblock status
 ```
 
 Requires membership in the `admin` group (the control socket is `0660 root:admin`).
 
-## What changed from Linux
+## Test
 
-| Linux | macOS |
-| --- | --- |
-| inotify on `/etc` | kqueue `EVFILT_VNODE` on the `/private/etc` directory AND on the current hosts inode (re-armed after every event) |
-| systemd unit with sandboxing | `LaunchDaemon` (`launchctl bootstrap system`); the systemd hardening has no launchd equivalent and is simply gone |
-| `resolvectl flush-caches` | `dscacheutil -flushcache; killall -HUP mDNSResponder` |
-| `SO_PEERCRED` | `getpeereid(2)` via ctypes |
-| `wheel` group | `admin` group |
-| `/usr/bin/python3` (system) | `/usr/bin/python3` (Apple Command Line Tools shim, root-owned, Python 3.9) |
-| Quickshell QML bar widget | Swift `NSStatusItem` + `NSPopover` app, run by a per-user `LaunchAgent` |
-| GNU `install -D` | BSD `install -d` + `install -m` |
+```sh
+./test.sh
+```
 
-`HOSTBLOCK_TEST_ROOT` still relocates all paths and drops the root check, so the
-watch/revert loop can be tested unprivileged. The socket path must stay short
-(AF_UNIX limit is 104 bytes on macOS).
+Runs the real daemon and CLI in a sandbox (`HOSTBLOCK_TEST_ROOT`): no root, no
+change to the real `/etc/hosts`. It checks add, refusal of IP addresses, that no
+remove verb exists, and that an edit and a delete are both reverted.
 
 ## Limitations
 
@@ -66,3 +108,37 @@ watch/revert loop can be tested unprivileged. The socket path must stay short
 There is no supported way from the UI or CLI. That is the feature. It takes
 root, stopping the daemon, and hand-editing the daemon's JSON state, then
 starting the daemon again. This is friction, not a lock.
+
+## Linux and macOS
+
+hostblock started as a Linux tool. The macOS port keeps the same four commitments;
+this is what changed underneath:
+
+| Linux | macOS |
+| --- | --- |
+| inotify on `/etc` | kqueue `EVFILT_VNODE` on the `/private/etc` directory AND on the current hosts inode (re-armed after every event) |
+| systemd unit with sandboxing | `LaunchDaemon` (`launchctl bootstrap system`); the systemd hardening has no launchd equivalent and is simply gone |
+| `resolvectl flush-caches` | `dscacheutil -flushcache; killall -HUP mDNSResponder` |
+| `SO_PEERCRED` | `getpeereid(2)` via ctypes |
+| `wheel` group | `admin` group |
+| `/usr/bin/python3` (system) | `/usr/bin/python3` (Apple Command Line Tools shim, root-owned, Python 3.9) |
+| Quickshell QML bar widget | Swift `NSStatusItem` + `NSPopover` app, run by a per-user `LaunchAgent` |
+| GNU `install -D` | BSD `install -d` + `install -m` |
+
+`HOSTBLOCK_TEST_ROOT` still relocates all paths and drops the root check, so the
+watch/revert loop can be tested unprivileged. The socket path must stay short
+(AF_UNIX limit is 104 bytes on macOS).
+
+## Contributing
+
+Bug reports and small, focused pull requests are welcome. Read
+[CONTRIBUTING.md](./CONTRIBUTING.md) first; note that a `remove` verb will not be
+accepted. Security issues go through [SECURITY.md](./SECURITY.md).
+
+## License
+
+[MIT](./LICENSE)
+
+<p align="center">
+  <img src="./assets/readme/footer.svg" width="100%" alt="hostblock: append-only, by design. MIT licensed.">
+</p>
