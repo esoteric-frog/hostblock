@@ -24,6 +24,40 @@ Click the shield, type a site, confirm, and it is routed to `127.0.0.1` and `::1
 in `/etc/hosts` for good. A root daemon owns that section of the file, puts it back
 within about 150 ms if anything edits it, and has no command to remove a site.
 
+## Who it is for
+
+hostblock is for people who are done negotiating with themselves.
+
+If a site has a hold on you (porn, gambling, a social feed, a forum you
+lose whole nights to), you already know how most blockers end. You set a
+limit when you feel strong. Later, in a weak moment, you turn it off in
+two clicks, and the limit was never really there. Screen Time, browser
+extensions and timers all share that flaw: the person who sets the limit
+can also lift it, right when it matters most.
+
+hostblock takes that choice away from your weakest moment and leaves it
+with your strongest one:
+
+- **The decision is made once.** You choose to block a site when you are
+  clear-headed. After you confirm, there is no button, menu or command to
+  take it back.
+- **The urge has nothing to bargain with.** Cravings tend to pass. The
+  daemon simply outlasts them: edit `/etc/hosts` and the block is back in
+  about 150 ms.
+- **No list to stare at.** The menu bar never shows what you blocked, so
+  the app itself never becomes a reminder or a trigger.
+- **You must mean it.** Every add shows the exact lines and asks you to
+  confirm, because every add is permanent.
+
+This is not a gentle focus timer. It is for people who are committed to
+real change and want their computer on their side. If you want a block you
+can pause tomorrow, use something else.
+
+A blocker removes easy access. It does not treat addiction. hostblock works
+best as one part of a larger plan: people you trust, a support group, or a
+professional. If you are struggling, reaching out to someone is the
+strongest step you can take.
+
 ## Why it is different
 
 1. **Append-only at the protocol level.** The daemon implements `add`, `list`,
