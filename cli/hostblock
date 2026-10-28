@@ -1,0 +1,138 @@
+#!/usr/bin/python3
+"""hostblock - client for hostblockd (macOS).
+
+Blocks a website by routing it to 127.0.0.1 in /etc/hosts. There is no unblock
+subcommand: the daemon does not implement one.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+
+_TEST_ROOT = os.environ.get("HOSTBLOCK_TEST_ROOT") or ""
+SOCKET_PATH = (os.path.join(_TEST_ROOT, "run", "sock") if _TEST_ROOT
+               else "/var/run/hostblock/sock")
+LAUNCHD_LABEL = "io.github.esoteric-frog.hostblockd"
+
+
+def request(payload):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(10.0)
+            sock.connect(SOCKET_PATH)
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+    except FileNotFoundError:
+        die("hostblockd is not running\n"
+            "  start it with: sudo launchctl kickstart -k system/%s" % LAUNCHD_LABEL)
+    except ConnectionRefusedError:
+        die("hostblockd is not accepting connections\n"
+            "  check it with: sudo launchctl print system/%s" % LAUNCHD_LABEL)
+    except PermissionError:
+        die("permission denied (you must be in the 'admin' group)")
+    except OSError as exc:
+        die("cannot talk to hostblockd: %s" % exc)
+
+    raw = b"".join(chunks).split(b"\n", 1)[0]
+    if not raw:
+        die("hostblockd closed the connection without replying")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        die("malformed reply from hostblockd: %s" % exc)
+
+
+def die(msg, code=1):
+    print("hostblock: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def cmd_add(args):
+    resp = request({"cmd": "add", "domains": args.domains})
+    if not resp.get("ok"):
+        die(resp.get("error", "unknown error"))
+
+    if args.json:
+        print(json.dumps(resp, indent=2))
+    else:
+        for item in resp.get("added", []):
+            print("blocked %s -> %s" % (item["domain"], ", ".join(item["names"])))
+        for domain in resp.get("already", []):
+            print("already blocked: %s" % domain)
+        for bad in resp.get("rejected", []):
+            print("refused %r: %s" % (bad["input"], bad["reason"]), file=sys.stderr)
+        if resp.get("added"):
+            print("\nDNS cache flushed. Tabs already open on the site may keep\n"
+                  "working until you reload them - browsers cache DNS themselves.")
+
+    if resp.get("rejected") and not resp.get("added"):
+        sys.exit(2)
+
+
+def cmd_list(args):
+    resp = request({"cmd": "list"})
+    if not resp.get("ok"):
+        die(resp.get("error", "unknown error"))
+    entries = resp.get("entries", [])
+    if args.json:
+        print(json.dumps(entries, indent=2))
+        return
+    if not entries:
+        print("nothing blocked yet")
+        return
+    width = max(len(e["domain"]) for e in entries)
+    for entry in reversed(entries):
+        print("%-*s  %s  (%s)" % (width, entry["domain"], entry.get("added", "?"),
+                                  ", ".join(entry.get("names", []))))
+    print("\n%d blocked" % len(entries))
+
+
+def cmd_status(args):
+    resp = request({"cmd": "status"})
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return
+    print("domains blocked : %s" % resp.get("count"))
+    print("hosts entries   : %s" % resp.get("names"))
+    print("/etc/hosts      : %s" % ("in sync" if resp.get("hostsInSync") else "OUT OF SYNC"))
+    print("last revert     : %s" % (resp.get("lastRevert") or "never"))
+    print("block addresses : %s" % ", ".join(resp.get("blockAddresses", [])))
+    print("resolver        : %s" % resp.get("resolver"))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="hostblock",
+        description="Block websites by routing them to 127.0.0.1 in /etc/hosts.",
+        epilog="Blocks are permanent by design; there is no unblock command.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="block one or more websites (permanent)")
+    p_add.add_argument("domains", nargs="+", metavar="DOMAIN")
+    p_add.add_argument("--json", action="store_true")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="show blocked websites")
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_status = sub.add_parser("status", help="show daemon and /etc/hosts state")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=cmd_status)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

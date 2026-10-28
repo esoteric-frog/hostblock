@@ -1,0 +1,660 @@
+#!/usr/bin/python3
+"""hostblockd (macOS) - append-only /etc/hosts website blocker with tamper reversion.
+
+Owns a fenced section of /private/etc/hosts. Anything that edits, replaces or
+deletes that section is undone within milliseconds; everything outside the
+fence is left strictly alone. Domains can be added over a unix socket and never
+removed - the protocol has no remove verb, which is the whole point.
+
+Stdlib only. Single-threaded select() loop over a kqueue and the socket.
+Ported from the Linux/systemd version: inotify -> kqueue, SO_PEERCRED ->
+getpeereid, systemd-resolved flush -> dscacheutil + mDNSResponder, wheel -> admin.
+"""
+
+import ctypes
+import ctypes.util
+import errno
+import grp
+import ipaddress
+import json
+import os
+import re
+import select
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+# HOSTBLOCK_TEST_ROOT relocates every path under a sandbox directory and drops
+# the root requirement, so the watch/revert behaviour can be exercised by an
+# unprivileged test run. The launchd plist never sets it.
+TEST_ROOT = os.environ.get("HOSTBLOCK_TEST_ROOT") or ""
+DEBUG = bool(os.environ.get("HOSTBLOCK_DEBUG"))
+
+if TEST_ROOT:
+    ETC = os.path.join(TEST_ROOT, "etc")
+    STATE_DIR = os.path.join(TEST_ROOT, "var")
+    RUN_DIR = os.path.join(TEST_ROOT, "run")
+else:
+    # /etc is a symlink to /private/etc on macOS. Watch and write the real
+    # directory so the kqueue descriptor and the atomic rename agree.
+    ETC = "/private/etc"
+    STATE_DIR = "/Library/Application Support/hostblock"
+    RUN_DIR = "/var/run/hostblock"
+
+HOSTS = os.path.join(ETC, "hosts")
+STATE_FILE = os.path.join(STATE_DIR, "blocklist.json")
+AUDIT_LOG = os.path.join(STATE_DIR, "audit.log")
+SOCKET_PATH = os.path.join(RUN_DIR, "sock")
+SOCKET_GROUP = "admin"          # macOS: "admin" is the administrators group
+LAUNCHD_LABEL = "io.github.esoteric-frog.hostblockd"
+
+BEGIN = "# BEGIN hostblock - managed by hostblockd, manual edits are reverted"
+END = "# END hostblock"
+
+DEBOUNCE = 0.15       # coalesce the burst of events a single `sed -i ''` produces
+SAFETY_NET = 60.0     # periodic reconcile, in case an event is ever missed
+DEFAULT_ADDRESSES = ["127.0.0.1", "::1"]
+
+# Last-resort content if /etc/hosts vanishes before we ever snapshotted it.
+# This is Apple's stock file.
+DEFAULT_PREAMBLE = [
+    "##",
+    "# Host Database",
+    "#",
+    "# localhost is used to configure the loopback interface",
+    "# when the system is booting.  Do not change this entry.",
+    "##",
+    "127.0.0.1\tlocalhost",
+    "255.255.255.255\tbroadcasthost",
+    "::1             localhost",
+]
+
+LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+# --------------------------------------------------------------------------
+# state
+# --------------------------------------------------------------------------
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as exc:
+        # Never start from a blank slate on a parse error - that would silently
+        # unblock everything, which is the one failure this tool must not have.
+        log(f"FATAL: cannot read {STATE_FILE}: {exc}")
+        sys.exit(1)
+
+    data.setdefault("version", 1)
+    addrs = data.get("blockAddresses")
+    if not isinstance(addrs, list) or not addrs:
+        data["blockAddresses"] = list(DEFAULT_ADDRESSES)
+    if not isinstance(data.get("entries"), list):
+        data["entries"] = []
+    return data
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".blocklist-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+            fh.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def audit(event, detail):
+    try:
+        os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+        with open(AUDIT_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"{now_iso()}\t{event}\t{detail}\n")
+    except OSError as exc:
+        log(f"warning: cannot write audit log: {exc}")
+
+
+# --------------------------------------------------------------------------
+# domain normalization and validation
+# --------------------------------------------------------------------------
+
+def _self_names():
+    names = {"localhost", "localhost.localdomain", "broadcasthost",
+             "ip6-localhost", "ip6-loopback"}
+    try:
+        host = socket.gethostname().lower()
+        if host:
+            names.add(host)
+            names.add(host.split(".")[0])
+    except OSError:
+        pass
+    return names
+
+
+SELF_NAMES = _self_names()
+
+
+def normalize(raw):
+    """Return (domain, None) or (None, reason). Accepts pasted URLs."""
+    s = str(raw).strip()
+    if not s:
+        return None, "empty"
+
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in s:
+        s = s.rsplit("@", 1)[1]
+    if s.startswith("[") or s.count(":") >= 2:
+        return None, "IP literals cannot be blocked by hostname"
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    s = s.strip().strip(".").lower()
+    if not s:
+        return None, "empty"
+
+    if not s.isascii():
+        try:
+            s = s.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            return None, "not a valid international domain name"
+
+    try:
+        ipaddress.ip_address(s)
+        return None, "that is an IP address, not a hostname"
+    except ValueError:
+        pass
+
+    if len(s) > 253:
+        return None, "longer than 253 characters"
+    labels = s.split(".")
+    if len(labels) < 2:
+        return None, "needs at least two labels (e.g. example.com)"
+    for label in labels:
+        if not LABEL_RE.match(label):
+            return None, f"invalid label {label!r}"
+    if labels[-1].isdigit():
+        return None, "top-level label cannot be all digits"
+
+    if s in SELF_NAMES or labels[0] in SELF_NAMES:
+        return None, "refusing to block this machine's own name"
+    if s.endswith(".local"):
+        return None, ".local names are Bonjour/mDNS names on macOS and are not resolved via /etc/hosts"
+    if s.endswith(".arpa"):
+        return None, "reverse-DNS names cannot be blocked this way"
+
+    return s, None
+
+
+def expand(domain):
+    """apex + www, per the chosen domain scope."""
+    if domain.startswith("www."):
+        apex = domain[4:]
+        return [domain, apex] if "." in apex else [domain]
+    return [domain, "www." + domain]
+
+
+# --------------------------------------------------------------------------
+# /etc/hosts rendering and reconciliation
+# --------------------------------------------------------------------------
+
+def render_section(state):
+    lines = [BEGIN]
+    for entry in state["entries"]:
+        for addr in state["blockAddresses"]:
+            for name in entry.get("names", []):
+                lines.append(f"{addr}\t{name}")
+    lines.append(END)
+    return lines
+
+
+def split_hosts(text):
+    """-> (before, managed, after). Managed is None when no fence is present."""
+    lines = text.splitlines()
+    try:
+        i = lines.index(BEGIN)
+    except ValueError:
+        return lines, None, []
+    for j in range(i + 1, len(lines)):
+        if lines[j] == END:
+            return lines[:i], lines[i:j + 1], lines[j + 1:]
+    # Fence opened but never closed - treat the remainder as managed and rebuild.
+    return lines[:i], lines[i:], []
+
+
+def read_hosts():
+    try:
+        with open(HOSTS, "r", encoding="utf-8", errors="surrogateescape") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        log(f"warning: cannot read {HOSTS}: {exc}")
+        return None
+
+
+def write_hosts(lines):
+    body = "\n".join(lines).rstrip("\n") + "\n"
+    # Temp file in the same directory so rename(2) stays on one filesystem.
+    fd, tmp = tempfile.mkstemp(dir=ETC, prefix=".hosts-hostblock-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(body)
+        os.chmod(tmp, 0o644)
+        if not TEST_ROOT:
+            os.chown(tmp, 0, 0)
+        os.replace(tmp, HOSTS)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Blocker:
+    def __init__(self):
+        self.state = load_state()
+        self.last_revert = None
+        self.in_sync = True
+        self.resolver_active = False
+        self.refresh_resolver_probe()
+
+    def reconcile(self, reason="watch"):
+        """The single write path. Idempotent: a matching section writes nothing,
+        which is what keeps our own writes from feeding back as a loop."""
+        text = read_hosts()
+        if text is None:
+            return False
+        before, managed, after = split_hosts(text)
+
+        # Keep a copy of everything outside our fence. If /etc/hosts is deleted
+        # or truncated we must put `127.0.0.1 localhost` back too - recreating
+        # the file with only our own section would break name resolution for
+        # the whole machine.
+        if text.strip():
+            snapshot = {"before": before, "after": after}
+            if self.state.get("unmanaged") != snapshot:
+                self.state["unmanaged"] = snapshot
+                save_state(self.state)
+        else:
+            saved = self.state.get("unmanaged") or {}
+            before = saved.get("before") or list(DEFAULT_PREAMBLE)
+            after = saved.get("after") or []
+            managed = None
+
+        expected = render_section(self.state)
+
+        if managed == expected:
+            self.in_sync = True
+            return False
+
+        had_fence = managed is not None
+        if had_fence:
+            new_lines = before + expected + after
+        else:
+            new_lines = before + ([""] if before and before[-1].strip() else []) + expected
+
+        try:
+            write_hosts(new_lines)
+        except OSError as exc:
+            self.in_sync = False
+            log(f"ERROR: cannot write {HOSTS}: {exc}")
+            return False
+
+        self.in_sync = True
+        if reason == "watch" and had_fence:
+            self.last_revert = now_iso()
+            log(f"reverted tampering in {HOSTS}")
+            audit("revert", f"restored {len(self.state['entries'])} blocked domains")
+        elif not had_fence and reason == "watch":
+            self.last_revert = now_iso()
+            log(f"managed section was missing from {HOSTS}; restored")
+            audit("revert", "managed section missing, restored")
+        elif reason == "sweep":
+            # A sweep should never find work: if it does, the watch missed an
+            # event. Say so loudly instead of fixing it in silence.
+            self.last_revert = now_iso()
+            log(f"WARNING: sweep found {HOSTS} out of sync (watch missed an event); restored")
+            audit("revert", "sweep found hosts out of sync, restored")
+
+        self.flush_dns()
+        return True
+
+    def flush_dns(self):
+        """Refresh the resolver so a just-blocked name stops resolving now.
+
+        On macOS, mDNSResponder is the system resolver and it is what honours
+        /etc/hosts; flushing its cache is the operative step.
+
+        Spawned, never waited on. This runs on the same thread as the watcher;
+        waiting would mean tampering went un-reverted for as long as the flush
+        hung.
+        """
+        if TEST_ROOT:
+            return
+        _spawn(["/bin/sh", "-c",
+                "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder"])
+
+    def refresh_resolver_probe(self):
+        self.resolver_active = _process_running("mDNSResponder")
+
+    def add(self, raw_domains, uid):
+        added, already, rejected = [], [], []
+        known = {n for e in self.state["entries"] for n in e.get("names", [])}
+
+        for raw in raw_domains:
+            domain, reason = normalize(raw)
+            if reason:
+                rejected.append({"input": str(raw), "reason": reason})
+                continue
+            names = [n for n in expand(domain) if n not in known]
+            if not names:
+                already.append(domain)
+                continue
+            known.update(names)
+            self.state["entries"].append({
+                "domain": domain,
+                "names": names,
+                "added": now_iso(),
+                "addedByUid": uid,
+            })
+            added.append({"domain": domain, "names": names})
+
+        if added:
+            save_state(self.state)
+            self.reconcile(reason="add")
+            for item in added:
+                audit("add", f"uid={uid} {item['domain']} -> {','.join(item['names'])}")
+            log(f"added {', '.join(i['domain'] for i in added)} (uid {uid})")
+
+        return {"ok": True, "added": added, "already": already, "rejected": rejected}
+
+    def status(self):
+        return {
+            "ok": True,
+            "count": len(self.state["entries"]),
+            "names": sum(len(e.get("names", [])) for e in self.state["entries"]),
+            "hostsInSync": self.in_sync,
+            "lastRevert": self.last_revert,
+            "blockAddresses": self.state["blockAddresses"],
+            "resolver": "mDNSResponder" if self.resolver_active else "unknown",
+        }
+
+
+_children = []
+
+
+def _spawn(cmd):
+    """Start a helper without waiting for it. Reaped by _reap() in the loop."""
+    try:
+        _children.append(subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"warning: {cmd[0]} failed to start: {exc}")
+
+
+def _reap():
+    for child in list(_children):
+        if child.poll() is not None:
+            _children.remove(child)
+
+
+def _process_running(name):
+    try:
+        return subprocess.run(["/usr/bin/pgrep", "-x", name], timeout=10,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                              ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# --------------------------------------------------------------------------
+# kqueue watch
+# --------------------------------------------------------------------------
+
+O_EVTONLY = getattr(os, "O_EVTONLY", 0x8000)   # os.O_EVTONLY only exists from 3.10
+VNODE_FLAGS = (select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+               | select.KQ_NOTE_EXTEND | select.KQ_NOTE_ATTRIB | select.KQ_NOTE_REVOKE)
+
+
+class HostsWatch:
+    """Watch the /private/etc *directory* AND the current hosts inode.
+
+    The directory watch catches replacement (sed -i '', mv, most editors give
+    the file a new inode - an inode-only watch goes deaf exactly then). The
+    inode watch catches in-place writes (`echo > /etc/hosts`), which never
+    touch the directory. After every event the inode watch is re-armed on
+    whatever file is at the path now.
+    """
+
+    def __init__(self):
+        self.kq = select.kqueue()
+        self.dir_fd = os.open(ETC, os.O_RDONLY | O_EVTONLY)
+        self.kq.control([select.kevent(
+            self.dir_fd, filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=VNODE_FLAGS)], 0, 0)
+        self.file_fd = None
+        self.rearm_file()
+
+    def fileno(self):
+        return self.kq.fileno()
+
+    def rearm_file(self):
+        if self.file_fd is not None:
+            try:
+                os.close(self.file_fd)          # closing removes its kevent
+            except OSError:
+                pass
+            self.file_fd = None
+        try:
+            fd = os.open(HOSTS, os.O_RDONLY | O_EVTONLY)
+        except OSError:
+            return                              # file missing; the dir watch will see it return
+        try:
+            self.kq.control([select.kevent(
+                fd, filter=select.KQ_FILTER_VNODE,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=VNODE_FLAGS)], 0, 0)
+            self.file_fd = fd
+        except OSError:
+            os.close(fd)
+
+    def drain(self):
+        """-> True if anything happened. kqueue gives no filename for directory
+        events, so every event counts; reconcile is idempotent and cheap."""
+        hit = False
+        while True:
+            try:
+                events = self.kq.control(None, 64, 0)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                raise
+            if not events:
+                return hit
+            hit = True
+
+
+# --------------------------------------------------------------------------
+# control socket
+# --------------------------------------------------------------------------
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_libc.getpeereid.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint32),
+                             ctypes.POINTER(ctypes.c_uint32)]
+_libc.getpeereid.restype = ctypes.c_int
+
+
+def make_socket():
+    os.makedirs(RUN_DIR, mode=0o750, exist_ok=True)
+    try:
+        gid = grp.getgrnam(SOCKET_GROUP).gr_gid
+    except KeyError:
+        gid = 0
+        log(f"warning: group {SOCKET_GROUP!r} not found; socket stays root-only")
+    if not TEST_ROOT:
+        os.chown(RUN_DIR, 0, gid)
+    os.chmod(RUN_DIR, 0o750)
+
+    if os.path.exists(SOCKET_PATH):
+        os.unlink(SOCKET_PATH)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCKET_PATH)
+    if not TEST_ROOT:
+        os.chown(SOCKET_PATH, 0, gid)
+    os.chmod(SOCKET_PATH, 0o660)
+    srv.listen(8)
+    srv.setblocking(False)
+    return srv
+
+
+def peer_uid(conn):
+    uid = ctypes.c_uint32(0)
+    gid = ctypes.c_uint32(0)
+    if _libc.getpeereid(conn.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+        return -1
+    return int(uid.value)
+
+
+def serve_one(conn, blocker):
+    conn.settimeout(5.0)
+    try:
+        uid = peer_uid(conn)
+        chunks = []
+        while b"\n" not in b"".join(chunks):
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(len(c) for c in chunks) > 1 << 20:
+                raise ValueError("request too large")
+        line = b"".join(chunks).split(b"\n", 1)[0]
+        if not line.strip():
+            return
+        req = json.loads(line.decode("utf-8"))
+        cmd = req.get("cmd")
+
+        if cmd == "add":
+            domains = req.get("domains") or []
+            if not isinstance(domains, list):
+                raise ValueError("domains must be a list")
+            resp = blocker.add(domains[:256], uid)
+        elif cmd == "list":
+            resp = {"ok": True, "entries": blocker.state["entries"]}
+        elif cmd == "status":
+            resp = blocker.status()
+        else:
+            # No remove, no clear, no disable. Append-only is enforced by the
+            # verb not existing, not by a client choosing not to send it.
+            resp = {"ok": False, "error": f"unknown command {cmd!r}"}
+
+        conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+    except Exception as exc:  # one bad client must never take the daemon down
+        try:
+            conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode())
+        except OSError:
+            pass
+        log(f"client error: {exc}")
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    if os.geteuid() != 0 and not TEST_ROOT:
+        sys.exit("hostblockd must run as root")
+    if TEST_ROOT:
+        os.makedirs(ETC, exist_ok=True)
+        log(f"TEST MODE: sandboxed under {TEST_ROOT}")
+
+    blocker = Blocker()
+    watch = HostsWatch()
+    srv = make_socket()
+
+    blocker.reconcile(reason="startup")
+    watch.rearm_file()
+    log(f"hostblockd ready: {len(blocker.state['entries'])} domains, "
+        f"watching {HOSTS}, socket {SOCKET_PATH}")
+
+    pending = None
+    next_sweep = time.monotonic() + SAFETY_NET
+
+    while True:
+        now = time.monotonic()
+        timeout = next_sweep - now
+        if pending is not None:
+            timeout = min(timeout, pending - now)
+        timeout = max(0.0, timeout)
+
+        try:
+            readable, _, _ = select.select([watch, srv], [], [], timeout)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            raise
+
+        if watch in readable:
+            if watch.drain():
+                if DEBUG:
+                    log("watch: event")
+                pending = time.monotonic() + DEBOUNCE
+
+        if srv in readable:
+            try:
+                conn, _ = srv.accept()
+            except (BlockingIOError, InterruptedError):
+                conn = None
+            except OSError as exc:
+                log(f"accept failed: {exc}")
+                conn = None
+            if conn is not None:
+                serve_one(conn, blocker)
+                watch.rearm_file()
+
+        now = time.monotonic()
+        if pending is not None and now >= pending:
+            pending = None
+            blocker.reconcile(reason="watch")
+            watch.rearm_file()
+        if now >= next_sweep:
+            next_sweep = now + SAFETY_NET
+            blocker.refresh_resolver_probe()
+            blocker.reconcile(reason="sweep")
+            watch.rearm_file()
+        _reap()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
